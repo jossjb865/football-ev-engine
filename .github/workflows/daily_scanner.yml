@@ -1,0 +1,54 @@
+name: Sports Betting Quantitative Scanner (+EV)
+
+on:
+  schedule:
+    # Ejecución automática diaria a las 06:00 AM UTC
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+    inputs:
+      target_date:
+        description: 'Fecha a analizar (YYYY-MM-DD). Dejar en blanco para hoy.'
+        required: false
+        default: ''
+      min_ev:
+        description: 'Umbral mínimo de EV (+% ej: 5.0)'
+        required: false
+        default: '5.0'
+
+permissions:
+  contents: write
+
+jobs:
+  run-scanner:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Clonar repositorio
+        uses: actions/checkout@v4
+
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Instalar dependencias
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Ejecutar Scanner con TheStatsAPI
+        env:
+          THESTATSAPI_API_KEY: ${{ secrets.THESTATSAPI_API_KEY }}
+          TARGET_DATE: ${{ github.event.inputs.target_date }}
+          MIN_EV: ${{ github.event.inputs.min_ev }}
+        run: |
+          python src/scanner.py
+
+      - name: Guardar informe en repositorio
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "GitHub Actions Bot"
+          git add reports/
+          git diff --staged --quiet || git commit -m "Auto: Reporte picks +EV [skip ci]"
+          git diff --staged --quiet || git push
