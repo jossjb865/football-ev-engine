@@ -41,13 +41,25 @@ class FeatureBuilder:
 
     # ------------------------------------------------------------------
     def _get_stats(self, client, match_id: str) -> Dict[str, Any]:
-        """Estadisticas con cache en memoria por partido (deduplicacion)."""
+        """Estadisticas con cache en memoria por partido (deduplicacion).
+
+        Maneja fallos de API de forma segura devolviendo un diccionario vacio
+        si el partido no posee estadisticas o no es encontrado (HTTP 404).
+        """
         if match_id in self._stats_cache:
             return self._stats_cache[match_id]
-        if self._stats_provider is not None:
-            stats = self._stats_provider(match_id) or {}
-        else:
-            stats = client.get_match_stats(match_id) if client else {}
+            
+        stats = {}
+        try:
+            if self._stats_provider is not None:
+                stats = self._stats_provider(match_id) or {}
+            else:
+                stats = client.get_match_stats(match_id) if client else {}
+        except Exception as e:
+            # Captura APIError o cualquier error de conexion para evitar que el pipeline falle
+            print(f"[WARNING] Error al obtener estadisticas para match_id {match_id}: {e}")
+            stats = {}
+
         self._stats_cache[match_id] = stats
         return stats
 
