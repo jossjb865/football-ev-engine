@@ -2,7 +2,7 @@ name: Sports Betting Quantitative Scanner (+EV)
 
 on:
   schedule:
-    # Ejecución automática diaria a las 06:00 AM UTC
+    # Ejecucion automatica diaria a las 06:00 AM UTC
     - cron: '0 6 * * *'
   workflow_dispatch:
     inputs:
@@ -11,9 +11,9 @@ on:
         required: false
         default: ''
       min_ev:
-        description: 'Umbral mínimo de EV (+% ej: 5.0)'
+        description: 'Umbral minimo de EV (+% ej: 5.0)'
         required: false
-        default: '5.0'
+        default: ''
 
 permissions:
   contents: write
@@ -40,10 +40,18 @@ jobs:
       - name: Ejecutar Scanner con TheStatsAPI
         env:
           THESTATSAPI_API_KEY: ${{ secrets.THESTATSAPI_API_KEY }}
-          TARGET_DATE: ${{ github.event.inputs.target_date }}
-          MIN_EV: ${{ github.event.inputs.min_ev }}
         run: |
-          python src/scanner.py
+          ARGS=""
+          [ -n "${{ github.event.inputs.min_ev }}" ] && ARGS="$ARGS --min-ev ${{ github.event.inputs.min_ev }}"
+          [ -n "${{ github.event.inputs.target_date }}" ] && ARGS="$ARGS --date ${{ github.event.inputs.target_date }}"
+          python -m src.scanner $ARGS
+
+      - name: Subir informes como artefactos
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: picks-report
+          path: reports/
 
       - name: Guardar informe en repositorio
         run: |
