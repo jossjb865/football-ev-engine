@@ -1,35 +1,123 @@
+"""Scanner cuantitativo de oportunidades +EV.
+
+Mejoras respecto a la version original:
+- CLI con argparse (--date, --min-ev, --models-dir, --out, --no-cache).
+- Logging estructurado en lugar de prints sueltos.
+- Cache de historiales por equipo y de estadisticas por partido (FeatureBuilder).
+- La consolidacion de cuotas es tolerante a datos malformados (no se cae).
+- Informe en Markdown + JSON, picks ordenados por EV descendente.
+- Stake sugerida con Kelly fraccional.
+- Compatible con ejecucion como paquete (python -m src.scanner) o directa.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import logging
 import os
 import sys
+from dataclasses import replace
 from datetime import datetime, timezone
-from collections import defaultdict
-from api_client import TheStatsAPIClient
-from feature_builder import FeatureBuilder
-from models_engine import ModelsEngine
+from pathlib import Path
 
-def main():
-    target_date = os.getenv("TARGET_DATE")
-    if not target_date or target_date.strip() == "":
-        target_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+try:
+    from .api_client import APIError, TheStatsAPIClient
+    from .config import ScannerConfig
+    from .feature_builder import FeatureBuilder
+    from .models_engine import ModelsEngine
+    from .odds_consolidator import consolidate
+except ImportError:  # ejecucion directa: python src/scanner.py
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from api_client import APIError, TheStatsAPIClient
+    from config import ScannerConfig
+    from feature_builder import FeatureBuilder
+    from models_engine import ModelsEngine
+    from odds_consolidator import consolidate
 
-    min_ev_str = os.getenv("MIN_EV", "5.0")
+log = logging.getLogger("ev-scanner")
+
+
+# ----------------------------------------------------------------------
+# CLI
+# ----------------------------------------------------------------------
+def parse_args(argv=None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Scanner cuantitativo +EV (lineas unicas y consolidadas)")
+    parser.add_argument("--date", default=os.getenv("TARGET_DATE", ""),
+                        help="Fecha a analizar YYYY-MM-DD (por defecto: hoy UTC).")
+    parser.add_argument("--min-ev", type=float, default=None,
+                        help="Umbral minimo de EV en %% (default: env MIN_EV o 5.0).")
+    parser.add_argument("--models-dir", default=os.getenv("MODELS_DIR"),
+                        help="Directorio con los modelos entrenados.")
+    parser.add_argument("--out", default="reports",
+                        help="Directorio de salida de informes.")
+    parser.add_argument("--no-cache", action="store_true",
+                        help="Desactiva el cache en disco de la API.")
+    return parser.parse_args(argv)
+
+
+# ----------------------------------------------------------------------
+# Informe
+# ----------------------------------------------------------------------
+def render_markdown(picks: list, target_date: str, min_ev_pct: float) -> str:
+    md = f"# 📊 Selecciones +EV Optimizadas ({target_date})\n\n"
+    md += (f"**Criterio:** Línea única por mercado | Solo Overs puros (.5) y BTTS Sí "
+           f"| Cuotas 1.40 a 3.80 | EV ≥ +{min_ev_pct:.1f}%\n\n")
+    if not picks:
+        return md + ("> ⚠️ **No se detectaron oportunidades con valor "
+                     "matemático suficiente para hoy.**\n")
+    md += ("| Partido | Selección / Mercado | Mejor Cuota | Prob. Real | "
+           "EV | Stake (Kelly ¼) | Casa |\n")
+    md += ("| :--- | :--- | :---: | :---: | :---: | :---: | :--- |\n")
+    for p in picks:
+        md += (f"| **{p['match']}** | `{p['market']}` | `{p['odd']:.2f}` "
+               f"| {p['p_real'] * 100:.1f}% | **+{p['ev'] * 100:.1f}%** "
+               f"| {p['stake'] * 100:.2f}% | {p['bookmaker']} |\n")
+    return md
+
+
+# ----------------------------------------------------------------------
+# Main
+# ----------------------------------------------------------------------
+def main(argv=None) -> int:
+    args = parse_args(argv)
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+
+    cfg = ScannerConfig()
+    if args.min_ev is not None:
+        cfg = replace(cfg, min_ev=args.min_ev / 100.0)
+    target_date = args.date.strip() or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    log.info("Fecha: %s | EV minimo: +%.1f%%", target_date, cfg.min_ev * 100)
+
+    client = TheStatsAPIClient(
+        cache_dir=None if args.no_cache else ".cache_api",
+        cache_ttl=6 * 3600,
+    )
+    builder = FeatureBuilder(half_life=cfg.recency_half_life)
+    engine = ModelsEngine(models_dir=args.models_dir)
+
     try:
-        min_ev_threshold = float(min_ev_str) / 100.0
-    except ValueError:
-        min_ev_threshold = 0.05
+        matches = client.get_fixtures(target_date)
+    except APIError as exc:
+        log.error("No se pudieron obtener los partidos: %s", exc)
+        return 1
+    log.info("Partidos programados encontrados: %d", len(matches))
 
-    print(f"=======================================================")
-    print(f"   SCANNER CUANTITATIVO +EV (Líneas Únicas y Consolidadas)")
-    print(f"   Fecha: {target_date} | EV Mínimo: +{min_ev_threshold*100:.1f}%")
-    print(f"=======================================================\n")
+    # Cache de historiales por equipo dentro de la corrida (deduplicacion).
+    history_cache: dict = {}
 
-    client = TheStatsAPIClient()
-    builder = FeatureBuilder()
-    engine = ModelsEngine(models_dir="models")
+    def history_of(team_id, limit: int) -> list:
+        if team_id not in history_cache:
+            try:
+                history_cache[team_id] = client.get_team_history(team_id, limit=limit)
+            except APIError as exc:
+                log.warning("Historial no disponible para %s: %s", team_id, exc)
+                history_cache[team_id] = []
+        return history_cache[team_id]
 
-    matches = client.get_fixtures(target_date)
-    print(f"Partidos programados encontrados: {len(matches)}")
-
-    final_picks = []
+    picks: list = []
 
     for match in matches:
         match_id = match.get("id")
@@ -37,192 +125,93 @@ def main():
         away = match.get("away_team", {})
         home_name = home.get("name", "Local")
         away_name = away.get("name", "Visitante")
+        label = f"{home_name} vs {away_name}"
 
         if not match.get("odds_available", False):
             continue
 
-        odds_data = client.get_match_odds(match_id)
+        try:
+            odds_data = client.get_match_odds(match_id)
+        except APIError as exc:
+            log.warning("Cuotas no disponibles para %s: %s", label, exc)
+            continue
         bookmakers = odds_data.get("bookmakers", [])
         if not bookmakers:
             continue
 
-        # Historial de métricas previas
-        h_hist = client.get_team_history(home.get("id"), limit=8)
-        a_hist = client.get_team_history(away.get("id"), limit=8)
-
-        h_stats = builder.extract_metrics(h_hist, home.get("id"), client)
-        a_stats = builder.extract_metrics(a_hist, away.get("id"), client)
+        # Metricas de forma (ponderadas por recencia, stats con cache)
+        h_stats = builder.extract_metrics(
+            history_of(home.get("id"), cfg.history_limit), home.get("id"), client)
+        a_stats = builder.extract_metrics(
+            history_of(away.get("id"), cfg.history_limit), away.get("id"), client)
         features = builder.build_feature_vector(h_stats, a_stats)
 
         # Tasas esperadas Poisson
-        lambda_goals_home = (h_stats["gf"] + a_stats["ga"]) / 2.0
-        lambda_goals_away = (a_stats["gf"] + h_stats["ga"]) / 2.0
-        lambda_corners_home = engine.predict_corners_lambda(features, fallback_lambda=h_stats["corners"])
-        lambda_sot_home = engine.predict_sot_lambda(features, fallback_lambda=h_stats["sot"])
+        lam_h = (h_stats["gf"] + a_stats["ga"]) / 2.0
+        lam_a = (a_stats["gf"] + h_stats["ga"]) / 2.0
+        lam_c = engine.predict_corners_lambda(features, h_stats["corners"])
+        lam_s = engine.predict_sot_lambda(features, h_stats["sot"])
 
-        match_label = f"{home_name} vs {away_name}"
+        best = consolidate(bookmakers, cfg)
 
-        # Consolidar la MEJOR cuota por mercado/línea entre todas las bookmakers
-        # Estructura: best_odds[mercado_key] = {"odd": max_odd, "bookmaker": nombre}
-        best_btts_yes = {"odd": 0.0, "bookmaker": ""}
-        best_total_goals = defaultdict(lambda: {"odd": 0.0, "bookmaker": ""})
-        best_corners = defaultdict(lambda: {"odd": 0.0, "bookmaker": ""})
-        best_sot = defaultdict(lambda: {"odd": 0.0, "bookmaker": ""})
+        groups = {
+            "btts": ([("BTTS: Sí",
+                       engine.predict_btts_probability(features, lam_h, lam_a),
+                       best["btts_yes"])]
+                     if best["btts_yes"]["odd"] > 0 else []),
+            "total_goals": [
+                (f"Over {line} Goles Totales",
+                 engine.calculate_poisson_over(lam_h + lam_a, line), data)
+                for line, data in best["total_goals"].items()],
+            "corners": [
+                (f"Over {line} Córners ({home_name})",
+                 engine.calculate_poisson_over(lam_c, line), data)
+                for line, data in best["corners"].items()],
+            "shots_on_target": [
+                (f"Over {line} Remates al Arco ({home_name})",
+                 engine.calculate_poisson_over(lam_s, line), data)
+                for line, data in best["shots_on_target"].items()],
+        }
 
-        for bm in bookmakers:
-            bm_name = bm.get("bookmaker", "Desconocido")
-            markets = bm.get("markets", {})
+        # REGLA: una sola linea por mercado (la de mayor EV)
+        for candidates in groups.values():
+            best_pick = None
+            for market_label, prob, data in candidates:
+                ev = engine.calculate_ev(prob, data["odd"])
+                if ev >= cfg.min_ev and (best_pick is None or ev > best_pick["ev"]):
+                    best_pick = {
+                        "match": label,
+                        "market": market_label,
+                        "odd": data["odd"],
+                        "p_real": prob,
+                        "ev": ev,
+                        "stake": engine.kelly_stake(
+                            prob, data["odd"], cfg.kelly_fraction),
+                        "bookmaker": data["bookmaker"],
+                    }
+            if best_pick:
+                picks.append(best_pick)
 
-            # 1. BTTS: Sí
-            if "btts" in markets:
-                odd_str = markets["btts"].get("yes", {}).get("last_seen")
-                if odd_str:
-                    odd = float(odd_str)
-                    if odd > best_btts_yes["odd"]:
-                        best_btts_yes = {"odd": odd, "bookmaker": bm_name}
+    picks.sort(key=lambda p: p["ev"], reverse=True)
 
-            # 2. Total Goles (Solo líneas puras .5 y cuotas de 1.40 a 3.80)
-            if "total_goals" in markets:
-                for line_str, outcomes in markets["total_goals"].items():
-                    try:
-                        line = float(line_str)
-                    except ValueError:
-                        continue
-                    # REGLA: Excluir asiáticos (.25, .75) y enteros. Solo .5
-                    if line % 1.0 != 0.5:
-                        continue
-                    odd_str = outcomes.get("over", {}).get("last_seen")
-                    if odd_str:
-                        odd = float(odd_str)
-                        if 1.40 <= odd <= 3.80 and odd > best_total_goals[line]["odd"]:
-                            best_total_goals[line] = {"odd": odd, "bookmaker": bm_name}
+    # ---- Salida: JSON + Markdown ----
+    out_dir = Path(args.out)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / f"picks_{target_date}.json").write_text(
+        json.dumps(picks, indent=2, ensure_ascii=False), encoding="utf-8")
 
-            # 3. Córners Local (Solo líneas puras .5 y cuotas de 1.40 a 3.80)
-            if "corners" in markets:
-                for line_str, outcomes in markets["corners"].items():
-                    try:
-                        line = float(line_str)
-                    except ValueError:
-                        continue
-                    if line % 1.0 != 0.5:
-                        continue
-                    odd_str = outcomes.get("over", {}).get("last_seen")
-                    if odd_str:
-                        odd = float(odd_str)
-                        if 1.40 <= odd <= 3.80 and odd > best_corners[line]["odd"]:
-                            best_corners[line] = {"odd": odd, "bookmaker": bm_name}
-
-            # 4. Remates al Arco Local (Solo líneas puras .5)
-            if "shots_on_target" in markets:
-                for line_str, outcomes in markets["shots_on_target"].items():
-                    try:
-                        line = float(line_str)
-                    except ValueError:
-                        continue
-                    if line % 1.0 != 0.5:
-                        continue
-                    odd_str = outcomes.get("over", {}).get("last_seen")
-                    if odd_str:
-                        odd = float(odd_str)
-                        if 1.40 <= odd <= 3.80 and odd > best_sot[line]["odd"]:
-                            best_sot[line] = {"odd": odd, "bookmaker": bm_name}
-
-        # --- EVALUACIÓN Y SELECCIÓN DEL PICK ÓPTIMO POR MERCADO ---
-
-        # Evaluar BTTS: Sí
-        if best_btts_yes["odd"] > 0:
-            p_real = engine.predict_btts_probability(features, lambda_goals_home, lambda_goals_away)
-            ev = engine.calculate_ev(p_real, best_btts_yes["odd"])
-            if ev >= min_ev_threshold:
-                final_picks.append({
-                    "match": match_label,
-                    "market": "BTTS: Sí",
-                    "odd": best_btts_yes["odd"],
-                    "p_real": p_real,
-                    "ev": ev,
-                    "bookmaker": best_btts_yes["bookmaker"]
-                })
-
-        # Evaluar Total Goles: SELECCIONAR ÚNICAMENTE LA MEJOR LÍNEA (Mayor EV)
-        best_goals_pick = None
-        for line, data in best_total_goals.items():
-            p_real = engine.calculate_poisson_over(lambda_goals_home + lambda_goals_away, line)
-            ev = engine.calculate_ev(p_real, data["odd"])
-            if ev >= min_ev_threshold:
-                candidate = {
-                    "match": match_label,
-                    "market": f"Over {line} Goles Totales",
-                    "odd": data["odd"],
-                    "p_real": p_real,
-                    "ev": ev,
-                    "bookmaker": data["bookmaker"]
-                }
-                if best_goals_pick is None or ev > best_goals_pick["ev"]:
-                    best_goals_pick = candidate
-        if best_goals_pick:
-            final_picks.append(best_goals_pick)
-
-        # Evaluar Córners: SELECCIONAR ÚNICAMENTE LA MEJOR LÍNEA
-        best_corners_pick = None
-        for line, data in best_corners.items():
-            p_real = engine.calculate_poisson_over(lambda_corners_home, line)
-            ev = engine.calculate_ev(p_real, data["odd"])
-            if ev >= min_ev_threshold:
-                candidate = {
-                    "match": match_label,
-                    "market": f"Over {line} Córners ({home_name})",
-                    "odd": data["odd"],
-                    "p_real": p_real,
-                    "ev": ev,
-                    "bookmaker": data["bookmaker"]
-                }
-                if best_corners_pick is None or ev > best_corners_pick["ev"]:
-                    best_corners_pick = candidate
-        if best_corners_pick:
-            final_picks.append(best_corners_pick)
-
-        # Evaluar Remates al Arco: SELECCIONAR ÚNICAMENTE LA MEJOR LÍNEA
-        best_sot_pick = None
-        for line, data in best_sot.items():
-            p_real = engine.calculate_poisson_over(lambda_sot_home, line)
-            ev = engine.calculate_ev(p_real, data["odd"])
-            if ev >= min_ev_threshold:
-                candidate = {
-                    "match": match_label,
-                    "market": f"Over {line} Remates al Arco ({home_name})",
-                    "odd": data["odd"],
-                    "p_real": p_real,
-                    "ev": ev,
-                    "bookmaker": data["bookmaker"]
-                }
-                if best_sot_pick is None or ev > best_sot_pick["ev"]:
-                    best_sot_pick = candidate
-        if best_sot_pick:
-            final_picks.append(best_sot_pick)
-
-    # Generación de la tabla final limpia
-    report_md = f"# 📊 Selecciones +EV Optimizadas ({target_date})\n\n"
-    report_md += f"**Criterio:** Línea única por mercado | Solo Overs puros (.5) y BTTS Sí | Cuotas 1.40 a 3.80 | EV $\\ge +{min_ev_threshold*100:.1f}\\%$\n\n"
-
-    if not final_picks:
-        report_md += "> ⚠️ **No se detectaron oportunidades con valor matemático suficiente para hoy.**\n"
-    else:
-        report_md += "| Partido | Selección / Mercado | Mejor Cuota | Prob. Real | Valor Esperado (+EV) | Casa |\n"
-        report_md += "| :--- | :--- | :---: | :---: | :---: | :--- |\n"
-        for p in final_picks:
-            report_md += f"| **{p['match']}** | `{p['market']}` | `{p['odd']:.2f}` | {p['p_real']*100:.1f}% | **+{p['ev']*100:.1f}%** | {p['bookmaker']} |\n"
-
-    os.makedirs("reports", exist_ok=True)
-    report_path = os.path.join("reports", f"picks_{target_date}.md")
-    with open(report_path, "w", encoding="utf-8") as f:
-        f.write(report_md)
+    report_md = render_markdown(picks, target_date, cfg.min_ev * 100)
+    (out_dir / f"picks_{target_date}.md").write_text(report_md, encoding="utf-8")
 
     summary_path = os.getenv("GITHUB_STEP_SUMMARY")
     if summary_path:
         with open(summary_path, "a", encoding="utf-8") as f:
             f.write(report_md)
 
-    print(f"\n[OK] Análisis finalizado. Total picks únicos de valor: {len(final_picks)}")
+    log.info("Analisis finalizado. Total picks unicos de valor: %d", len(picks))
+    print(report_md)
+    return 0
+
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
