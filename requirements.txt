@@ -1,3 +1,8 @@
+
+---
+
+### `requirements.txt`
+```text
 requests>=2.31.0
 numpy>=1.24.0
 scipy>=1.11.0
@@ -5,3 +10,5 @@ pandas>=2.1.0
 catboost>=1.2.0
 scikit-learn>=1.3.0
 joblib>=1.3.0
+# Desarrollo / tests:
+# pytest>=8.0.0
