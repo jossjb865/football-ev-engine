@@ -1,9 +1,9 @@
 """Backtester post-partido para football-ev-engine.
 
 Flujo:
-  1. El scanner, al detectar que un partido ya terminó, invoca
-     Backtester.record_outcome() con la predicción emitida.
-  2. El backtester actualiza métricas acumuladas (Brier, calibración,
+  1. El scanner, al detectar que un partido ya termino, invoca
+     Backtester.record_outcome() con la prediccion emitida.
+  2. El backtester actualiza metricas acumuladas (Brier, calibracion,
      hit-rate, EV realizado) y persiste en JSON.
   3. Al alcanzar el umbral de muestras, invoca reentrenamiento incremental.
 """
@@ -33,7 +33,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class MatchPrediction:
-    """Snapshot de la predicción emitida por el scanner."""
+    """Snapshot de la prediccion emitida por el scanner."""
     match_id: str
     home_team: str
     away_team: str
@@ -59,7 +59,7 @@ class MatchOutcome:
 
 @dataclass
 class BacktestMetrics:
-    """Métricas acumuladas del backtester."""
+    """Metricas acumuladas del backtester."""
     total_matches: int = 0
     hits: int = 0
     brier_sum: float = 0.0
@@ -87,8 +87,8 @@ class Backtester:
     """
     Motor de backtesting post-partido.
 
-    Uso típico desde scanner.py:
-        bt = Backtester()
+    Uso tipico desde scanner.py:
+        bt = Backtester(cfg=bt_cfg)
         bt.record_outcome(pred, outcome)
         if bt.should_retrain():
             bt.trigger_retrain()
@@ -120,7 +120,7 @@ class Backtester:
     # -- Registro de resultados ---------------------------------------------
 
     def record_outcome(self, pred: MatchPrediction, outcome: MatchOutcome) -> BacktestMetrics:
-        """Registra el resultado de un partido ya finalizado y actualiza métricas."""
+        """Registra el resultado de un partido ya finalizado y actualiza metricas."""
         self._append_jsonl(self.outcomes_file, asdict(outcome))
 
         self.metrics.total_matches += 1
@@ -147,13 +147,12 @@ class Backtester:
         )
         return self.metrics
 
-    # -- Decisión de reentrenamiento ----------------------------------------
+    # -- Decision de reentrenamiento ----------------------------------------
 
     def should_retrain(self) -> bool:
         """True si se acumularon suficientes muestras o Brier degradado."""
         if self.metrics.total_matches >= self.cfg.retrain_threshold:
             return True
-        # Detección temprana de degradación
         if (self.metrics.total_matches >= self.cfg.brier_min_samples
                 and self.metrics.brier_score > self.cfg.brier_degradation_threshold):
             return True
@@ -176,10 +175,9 @@ class Backtester:
             min_samples=self.cfg.brier_min_samples,
         )
 
-        # Resetear contador para el siguiente ciclo
         self.metrics = BacktestMetrics()
         self._save_metrics()
-        logger.info("Backtester: reentrenamiento completado, métricas reseteadas.")
+        logger.info("Backtester: reentrenamiento completado, metricas reseteadas.")
 
     # -- Utilidades ----------------------------------------------------------
 
