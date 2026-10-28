@@ -1,7 +1,7 @@
 """Scanner cuantitativo de oportunidades +EV.
 
 Mejoras respecto a la version original:
-- CLI con argparse (--date, --min-ev, --models-dir, --out, --no-cache).
+- CLI con argparse (--date, --min-ev, --models-dir, --out, --no-cache, --skip-backtest).
 - Logging estructurado en lugar de prints sueltos.
 - Cache de historiales por equipo y de estadisticas por partido (FeatureBuilder).
 - La consolidacion de cuotas es tolerante a datos malformados (no se cae).
@@ -76,7 +76,6 @@ def _resolve_market(match: dict, market_label: str, line: float) -> bool:
     if "BTTS" in market_label:
         return home_goals > 0 and away_goals > 0
 
-    # Extraer la linea del label: "Over 2.5 Goles Totales" -> 2.5
     try:
         line_val = float(line)
     except (ValueError, TypeError):
@@ -89,7 +88,6 @@ def _resolve_market(match: dict, market_label: str, line: float) -> bool:
         total_sot = score.get("home_sot", 0) + score.get("away_sot", 0)
         return total_sot > line_val
 
-    # Default: Goles Totales
     return total_goals > line_val
 
 
@@ -99,10 +97,9 @@ def _run_backtest(client: TheStatsAPIClient, bt_cfg: BacktestConfig,
     Fase de backtesting: detecta partidos finalizados de la fecha objetivo,
     recupera las predicciones previas y registra outcomes.
     """
-    bt = Backtester(data_dir=bt_cfg.data_dir)
+    bt = Backtester(cfg=bt_cfg)
     report = bt.get_report()
 
-    # Cargar predicciones previas emitidas para esta fecha
     pred_file = bt.data_dir / f"predictions_{target_date}.jsonl"
     if not pred_file.exists():
         log.info("Backtest: sin predicciones previas para %s, se omite.", target_date)
@@ -111,7 +108,6 @@ def _run_backtest(client: TheStatsAPIClient, bt_cfg: BacktestConfig,
     predictions = [json.loads(l) for l in pred_file.read_text().splitlines() if l.strip()]
     log.info("Backtest: %d predicciones previas para %s", len(predictions), target_date)
 
-    # Obtener resultados de los partidos finalizados
     try:
         matches = client.get_fixtures(target_date)
     except APIError as exc:
@@ -154,7 +150,6 @@ def _run_backtest(client: TheStatsAPIClient, bt_cfg: BacktestConfig,
 
             bt.record_outcome(m_pred, outcome)
 
-    # Verificar si hay que reentrenar
     if bt.should_retrain():
         bt.trigger_retrain()
 
@@ -181,7 +176,6 @@ def render_markdown(picks: list, target_date: str, min_ev_pct: float,
                    f"| {p['p_real'] * 100:.1f}% | **+{p['ev'] * 100:.1f}%** "
                    f"| {p['stake'] * 100:.2f}% | {p['bookmaker']} |\n")
 
-    # Sección de backtesting
     if backtest_report and backtest_report.get("total_matches", 0) > 0:
         md += ("\n## 📈 Backtesting\n\n")
         md += (f"| Métrica | Valor |\n| :--- | :---: |\n")
@@ -206,7 +200,6 @@ def _save_predictions_for_backtest(picks: list, matches: list,
     bt_dir.mkdir(parents=True, exist_ok=True)
     pred_file = bt_dir / f"predictions_{target_date}.jsonl"
 
-    # Mapear match_id por label
     match_map = {f"{m.get('home_team', {}).get('name', '')} vs "
                  f"{m.get('away_team', {}).get('name', '')}": m.get("id")
                  for m in matches}
@@ -214,7 +207,6 @@ def _save_predictions_for_backtest(picks: list, matches: list,
     records = []
     for p in picks:
         match_id = match_map.get(p["match"], "")
-        # Extraer line del label: "Over 2.5 Goles Totales" -> 2.5
         line = 0.0
         parts = p["market"].split()
         for i, part in enumerate(parts):
@@ -274,7 +266,6 @@ def main(argv=None) -> int:
         return 1
     log.info("Partidos programados encontrados: %d", len(matches))
 
-    # Cache de historiales por equipo dentro de la corrida (deduplicacion).
     history_cache: dict = {}
 
     def history_of(team_id, limit: int) -> list:
@@ -308,14 +299,12 @@ def main(argv=None) -> int:
         if not bookmakers:
             continue
 
-        # Metricas de forma (ponderadas por recencia, stats con cache)
         h_stats = builder.extract_metrics(
             history_of(home.get("id"), cfg.history_limit), home.get("id"), client)
         a_stats = builder.extract_metrics(
             history_of(away.get("id"), cfg.history_limit), away.get("id"), client)
         features = builder.build_feature_vector(h_stats, a_stats)
 
-        # Tasas esperadas Poisson
         lam_h = (h_stats["gf"] + a_stats["ga"]) / 2.0
         lam_a = (a_stats["gf"] + h_stats["ga"]) / 2.0
         lam_c = engine.predict_corners_lambda(features, h_stats["corners"])
@@ -342,7 +331,6 @@ def main(argv=None) -> int:
                 for line, data in best["shots_on_target"].items()],
         }
 
-        # REGLA: una sola linea por mercado (la de mayor EV)
         for candidates in groups.values():
             best_pick = None
             for market_label, prob, data in candidates:
