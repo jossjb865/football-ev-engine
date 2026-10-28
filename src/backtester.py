@@ -1,16 +1,12 @@
-"""
-Backtester post-partido para football-ev-engine.
+"""Backtester post-partido para football-ev-engine.
 
 Flujo:
   1. El scanner, al detectar que un partido ya terminó, invoca
      Backtester.record_outcome() con la predicción emitida.
   2. El backtester actualiza métricas acumuladas (Brier, calibración,
      hit-rate, EV realizado) y persiste en JSON.
-  3. Al alcanzar BACKTEST_RETRAIN_THRESHOLD muestras, invoca
-     train_champions_league.retrain_incremental() para actualizar
-     los pesos del modelo.
+  3. Al alcanzar el umbral de muestras, invoca reentrenamiento incremental.
 """
-
 from __future__ import annotations
 
 import json
@@ -23,9 +19,13 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
-from src.config import BACKTEST_DATA_DIR, BACKTEST_RETRAIN_THRESHOLD, EV_THRESHOLD
+try:
+    from .config import BacktestConfig
+except ImportError:
+    from config import BacktestConfig
 
 logger = logging.getLogger(__name__)
+
 
 # ---------------------------------------------------------------------------
 # Dataclasses
@@ -37,12 +37,12 @@ class MatchPrediction:
     match_id: str
     home_team: str
     away_team: str
-    market: str            # "btts", "total_goals", "corners", "shots_on_target"
-    line: float            # e.g. 2.5 para total goals
-    predicted_prob: float  # probabilidad del modelo (0-1)
-    odds: float            # mejor cuota consolidada
-    ev: float              # EV calculado por models_engine
-    kelly_stake: float     # fracción Kelly
+    market: str
+    line: float
+    predicted_prob: float
+    odds: float
+    ev: float
+    kelly_stake: float
     timestamp: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
 
@@ -52,8 +52,8 @@ class MatchOutcome:
     match_id: str
     market: str
     line: float
-    actual_value: float    # e.g. goles totales = 3.0, BTTS = 1 (sí) / 0 (no)
-    resolved: bool         # True si el mercado resolvió a favor de la predicción
+    actual_value: float
+    resolved: bool
     timestamp: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
 
@@ -65,7 +65,6 @@ class BacktestMetrics:
     brier_sum: float = 0.0
     ev_realized_sum: float = 0.0
     ev_predicted_sum: float = 0.0
-    calibration_bins: list = field(default_factory=list)
 
     @property
     def brier_score(self) -> float:
@@ -95,11 +94,11 @@ class Backtester:
             bt.trigger_retrain()
     """
 
-    def __init__(self, data_dir: Path = BACKTEST_DATA_DIR):
-        self.data_dir = Path(data_dir)
+    def __init__(self, cfg: Optional[BacktestConfig] = None):
+        self.cfg = cfg or BacktestConfig()
+        self.data_dir: Path = self.cfg.data_dir
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.metrics_file = self.data_dir / "backtest_metrics.json"
-        self.predictions_file = self.data_dir / "predictions.jsonl"
         self.outcomes_file = self.data_dir / "outcomes.jsonl"
         self.metrics: BacktestMetrics = self._load_metrics()
 
@@ -116,37 +115,22 @@ class Backtester:
 
     def _append_jsonl(self, path: Path, record: dict) -> None:
         with open(path, "a") as f:
-            f.write(json.dumps(record) + "\n")
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
     # -- Registro de resultados ---------------------------------------------
 
     def record_outcome(self, pred: MatchPrediction, outcome: MatchOutcome) -> BacktestMetrics:
-        """
-        Registra el resultado de un partido ya finalizado y actualiza métricas.
-
-        Parameters
-        ----------
-        pred : MatchPrediction
-            La predicción que emitió el scanner antes del partido.
-        outcome : MatchOutcome
-            El resultado real del mercado.
-        """
-        # 1. Persistir predicción y resultado
-        self._append_jsonl(self.predictions_file, asdict(pred))
+        """Registra el resultado de un partido ya finalizado y actualiza métricas."""
         self._append_jsonl(self.outcomes_file, asdict(outcome))
 
-        # 2. Actualizar métricas
         self.metrics.total_matches += 1
 
-        # Brier score: (prob - outcome_binary)²
         outcome_binary = 1.0 if outcome.resolved else 0.0
         self.metrics.brier_sum += (pred.predicted_prob - outcome_binary) ** 2
 
-        # Hit rate
         if outcome.resolved:
             self.metrics.hits += 1
 
-        # EV realizado: si acertó, gana (odds-1)*stake; si falló, -stake
         stake = pred.kelly_stake
         if outcome.resolved:
             pnl = (pred.odds - 1.0) * stake
@@ -155,7 +139,6 @@ class Backtester:
         self.metrics.ev_realized_sum += pnl
         self.metrics.ev_predicted_sum += pred.ev * stake
 
-        # 3. Persistir
         self._save_metrics()
         logger.info(
             "Backtest: match=%s market=%s hit=%s brier=%.4f ev_realized=%.4f",
@@ -167,41 +150,40 @@ class Backtester:
     # -- Decisión de reentrenamiento ----------------------------------------
 
     def should_retrain(self) -> bool:
-        """True si se acumularon suficientes muestras para reentrenar."""
-        return self.metrics.total_matches >= BACKTEST_RETRAIN_THRESHOLD
+        """True si se acumularon suficientes muestras o Brier degradado."""
+        if self.metrics.total_matches >= self.cfg.retrain_threshold:
+            return True
+        # Detección temprana de degradación
+        if (self.metrics.total_matches >= self.cfg.brier_min_samples
+                and self.metrics.brier_score > self.cfg.brier_degradation_threshold):
+            return True
+        return False
 
     def trigger_retrain(self) -> None:
-        """
-        Dispara reentrenamiento incremental usando los datos del backtest
-        como validación out-of-sample.
-        """
+        """Dispara reentrenamiento incremental."""
         logger.info("Backtester: umbral alcanzado (%d), disparando reentrenamiento.",
                     self.metrics.total_matches)
 
-        # Import dinámico para evitar circular import
-        from train_champions_league import retrain_incremental
+        try:
+            from train_champions_league import retrain_incremental
+        except ImportError:
+            from ..train_champions_league import retrain_incremental
 
-        # Cargar outcomes como dataset de validación
         outcomes_df = self._load_outcomes_df()
         retrain_incremental(
             validation_df=outcomes_df,
-            brier_threshold=0.25,          # re-entrenar si Brier > 0.25
-            min_samples=BACKTEST_RETRAIN_THRESHOLD,
+            brier_threshold=self.cfg.brier_degradation_threshold,
+            min_samples=self.cfg.brier_min_samples,
         )
 
         # Resetear contador para el siguiente ciclo
-        self.metrics.total_matches = 0
-        self.metrics.hits = 0
-        self.metrics.brier_sum = 0.0
-        self.metrics.ev_realized_sum = 0.0
-        self.metrics.ev_predicted_sum = 0.0
+        self.metrics = BacktestMetrics()
         self._save_metrics()
         logger.info("Backtester: reentrenamiento completado, métricas reseteadas.")
 
     # -- Utilidades ----------------------------------------------------------
 
     def _load_outcomes_df(self) -> pd.DataFrame:
-        """Carga outcomes acumulados como DataFrame para reentrenamiento."""
         if not self.outcomes_file.exists():
             return pd.DataFrame()
         records = [json.loads(line) for line in self.outcomes_file.read_text().splitlines() if line.strip()]
